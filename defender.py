@@ -4,7 +4,8 @@ Defender-style arcade game.
 A horizontally-wrapping planet: fly over the terrain, shoot down Landers
 before they abduct your Humans, rescue any Human that gets dropped in
 mid-air, and clear each wave. Losing every Human on a wave turns the
-remaining Landers into fast, aggressive Mutants.
+remaining Landers into fast, aggressive Mutants. Swarmers - small, fast,
+erratic enemies - spawn in loose bursts throughout every wave.
 
 Controls:
     LEFT / RIGHT  - horizontal thrust (also sets which way you're facing)
@@ -84,9 +85,16 @@ display = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
 pygame.display.set_caption('Defender')
 clock = pygame.time.Clock()
 
-bullet_img = pygame.image.load('img/icons/bullet.png').convert_alpha()
-player_bullet_img = tint_surface(pygame.transform.scale(bullet_img, (22, 6)), GREEN)
-enemy_bullet_img = tint_surface(pygame.transform.scale(bullet_img, (14, 6)), RED)
+def make_laser_image(length, color):
+    """a long, thin glowing beam - a soft outer glow behind a bright core"""
+    surf = pygame.Surface((length, 12), pygame.SRCALPHA)
+    pygame.draw.rect(surf, (*color, 90), (0, 2, length, 8), border_radius=4)
+    pygame.draw.rect(surf, (*color, 255), (0, 5, length, 2), border_radius=1)
+    return surf
+
+
+player_bullet_img = make_laser_image(58, GREEN)
+enemy_bullet_img = make_laser_image(36, RED)
 
 
 def load_numbered_images(folder, count, size):
@@ -99,10 +107,18 @@ def load_numbered_images(folder, count, size):
     return images
 
 
+LANDER_COLOR = (200, 120, 255)
+MUTANT_COLOR = (255, 90, 90)
+SWARMER_COLOR = (255, 220, 60)
+
 human_images = load_numbered_images('img/tile/humans/renamed', 8, (22, 30))
 monster_images = load_numbered_images('img/tile/monsters/renamed', 10, (40, 40))
-lander_images = [tint_surface(img, (200, 120, 255)) for img in monster_images]
-mutant_images = [tint_surface(img, (255, 90, 90)) for img in monster_images]
+lander_images = [tint_surface(img, LANDER_COLOR) for img in monster_images]
+mutant_images = [tint_surface(img, MUTANT_COLOR) for img in monster_images]
+swarmer_images = [
+    tint_surface(pygame.transform.scale(img, (22, 22)), SWARMER_COLOR)
+    for img in monster_images
+]
 
 laser_sound = mixer.Sound('sounds/laser.wav')
 laser_sound.set_volume(0.3)
@@ -114,6 +130,14 @@ rescue_sound = mixer.Sound('sounds/rescue.wav')
 rescue_sound.set_volume(0.5)
 bomb_sound = mixer.Sound('sounds/bomb.wav')
 bomb_sound.set_volume(0.6)
+thrust_sound = mixer.Sound('sounds/thrust.wav')
+thrust_sound.set_volume(0.35)
+
+# channel 0 is reserved exclusively for the looping thrust sound so it
+# doesn't get cut off by (or steal) the channel auto-picked for one-shot
+# sounds like the laser or explosions
+mixer.set_reserved(1)
+thrust_channel = mixer.Channel(0)
 
 mixer.music.load('sounds/alien_theme.wav')
 mixer.music.set_volume(0.3)
@@ -123,20 +147,31 @@ mixer.music.play(loops=-1)
 # ---------------------------------------------------------------------------
 # entities
 # ---------------------------------------------------------------------------
+STAR_COLORS = [
+    WHITE, WHITE,
+    CYAN,
+    YELLOW,
+    (255, 170, 210),  # pink
+    (170, 180, 255),  # pale blue
+    (170, 255, 210),  # pale green
+]
+
+
 class Star:
     def __init__(self):
         self.x = random.uniform(0, WORLD_WIDTH)
         self.y = random.uniform(20, TOP_MARGIN + 380)
         self.size = random.choice([1, 1, 2])
         self.parallax = random.uniform(0.2, 0.5)
+        self.color = random.choice(STAR_COLORS)
 
     def draw(self, surface, cam_x):
         for sx in screen_positions(self.x, cam_x * self.parallax):
-            pygame.draw.rect(surface, WHITE, (sx, self.y, self.size, self.size))
+            pygame.draw.rect(surface, self.color, (sx, self.y, self.size, self.size))
 
 
 class Bullet:
-    speed = 18
+    speed = 20
 
     def __init__(self, x, y, direction, hostile=False):
         self.x = x
@@ -144,7 +179,7 @@ class Bullet:
         self.vx = direction * self.speed
         self.hostile = hostile
         self.radius = 5
-        self.life = 60
+        self.life = 110
         self.image = enemy_bullet_img if hostile else player_bullet_img
         if direction < 0:
             self.image = pygame.transform.flip(self.image, True, False)
@@ -186,6 +221,42 @@ class Explosion:
                 surface.blit(halo, (sx - radius, self.y - radius))
 
 
+class Disintegration:
+    """smart-bomb kill effect: the target breaks apart into fading pixel debris"""
+    duration = 500
+
+    def __init__(self, x, y, color, particle_count=16):
+        self.x = x
+        self.y = y
+        self.color = color
+        self.spawn_time = pygame.time.get_ticks()
+        self.particles = []
+        for _ in range(particle_count):
+            angle = random.uniform(0, 2 * math.pi)
+            speed = random.uniform(1.5, 5.5)
+            self.particles.append({
+                'dx': math.cos(angle) * speed,
+                'dy': math.sin(angle) * speed,
+                'size': random.randint(2, 5),
+            })
+
+    def dead(self):
+        return pygame.time.get_ticks() - self.spawn_time > self.duration
+
+    def draw(self, surface, cam_x):
+        elapsed = pygame.time.get_ticks() - self.spawn_time
+        progress = elapsed / self.duration
+        alpha = max(0, int(255 * (1 - progress)))
+        for sx in screen_positions(self.x, cam_x):
+            for p in self.particles:
+                px = sx + p['dx'] * elapsed * 0.07
+                py = self.y + p['dy'] * elapsed * 0.07
+                size = max(1, int(p['size'] * (1 - progress)))
+                particle = pygame.Surface((size, size), pygame.SRCALPHA)
+                particle.fill((*self.color, alpha))
+                surface.blit(particle, (px - size / 2, py - size / 2))
+
+
 class Human:
     def __init__(self, x):
         self.x = x
@@ -221,6 +292,7 @@ class Human:
 
 class Lander:
     speed = 1.6
+    score_value = 150
 
     def __init__(self, x, game):
         self.x = x
@@ -273,6 +345,7 @@ class Lander:
 class Mutant:
     speed = 3.2
     fire_interval = 90
+    score_value = 150
 
     def __init__(self, x, y):
         self.x = x
@@ -294,6 +367,46 @@ class Mutant:
             self.fire_cooldown = self.fire_interval
             direction = 1 if dx > 0 else -1
             bullets.append(Bullet(self.x, self.y, direction, hostile=True))
+
+    def draw(self, surface, cam_x):
+        for sx in screen_positions(self.x, cam_x):
+            rect = self.image.get_rect(center=(sx, self.y))
+            surface.blit(self.image, rect)
+
+
+class Swarmer:
+    """small, fast, erratic enemy that darts around in loose homing bursts"""
+    speed = 4.5
+    score_value = 60
+
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+        self.image = random.choice(swarmer_images)
+        self.radius = 10
+        self.vx = 0.0
+        self.vy = 0.0
+        self.retarget_at = 0
+
+    def update(self, player):
+        now = pygame.time.get_ticks()
+        if now >= self.retarget_at:
+            self.retarget_at = now + random.randint(200, 500)
+            dx = wrapped_dx(player.x, self.x)
+            dy = player.y - self.y
+            dist = math.hypot(dx, dy) or 1
+            jitter_angle = random.uniform(0, 2 * math.pi)
+            homing_weight = 0.35
+            jx, jy = math.cos(jitter_angle), math.sin(jitter_angle)
+            vx = jx * (1 - homing_weight) + (dx / dist) * homing_weight
+            vy = jy * (1 - homing_weight) + (dy / dist) * homing_weight
+            norm = math.hypot(vx, vy) or 1
+            self.vx = vx / norm
+            self.vy = vy / norm
+
+        self.x = (self.x + self.vx * self.speed) % WORLD_WIDTH
+        self.y += self.vy * self.speed
+        self.y = max(TOP_MARGIN, min(self.y, terrain_height(self.x) - 10))
 
     def draw(self, surface, cam_x):
         for sx in screen_positions(self.x, cam_x):
@@ -334,7 +447,12 @@ class Ship:
         if keys[pygame.K_DOWN]:
             thrust_y += 1
 
+        was_thrusting = self.thrusting
         self.thrusting = bool(thrust_x or thrust_y)
+        if self.thrusting and not was_thrusting:
+            thrust_channel.play(thrust_sound, loops=-1)
+        elif was_thrusting and not self.thrusting:
+            thrust_channel.stop()
         self.vx = (self.vx + thrust_x * self.accel) * self.drag
         self.vy = (self.vy + thrust_y * self.accel) * self.drag
         self.vx = max(-self.max_speed, min(self.max_speed, self.vx))
@@ -397,6 +515,7 @@ class Game:
         self.humans = []
         self.landers = []
         self.mutants = []
+        self.swarmers = []
         self.bullets = []
         self.explosions = []
         self.score = 0
@@ -408,6 +527,8 @@ class Game:
         self.banner_until = 0
         self.last_hyperspace = 0
         self.no_humans_left = False
+        self.last_swarm_spawn = pygame.time.get_ticks()
+        self.swarm_interval = random.randint(9000, 15000)
         self.start_wave()
 
     def start_wave(self):
@@ -455,16 +576,27 @@ class Game:
                 self.mutants.append(Mutant(lander.x, lander.y))
             self.landers = []
 
+    def spawn_swarm(self):
+        sx = random.uniform(0, WORLD_WIDTH)
+        sy = random.uniform(TOP_MARGIN + 20, GROUND_BASE - 150)
+        for _ in range(random.randint(6, 9)):
+            self.swarmers.append(Swarmer(sx + random.uniform(-30, 30), sy + random.uniform(-30, 30)))
+
     def smart_bomb(self):
         if self.bombs <= 0 or self.state != 'playing':
             return
         self.bombs -= 1
         killed = False
-        for group, is_lander_group in ((self.landers, True), (self.mutants, False)):
+        groups = (
+            (self.landers, True, LANDER_COLOR),
+            (self.mutants, False, MUTANT_COLOR),
+            (self.swarmers, False, SWARMER_COLOR),
+        )
+        for group, is_lander_group, color in groups:
             for enemy in list(group):
                 if abs(wrapped_dx(enemy.x, self.ship.x)) < SCREEN_WIDTH / 2 + 60:
-                    self.explosions.append(Explosion(enemy.x, enemy.y))
-                    self.score += 150
+                    self.explosions.append(Disintegration(enemy.x, enemy.y, color))
+                    self.score += enemy.score_value
                     if is_lander_group:
                         self.destroy_lander(enemy)
                     else:
@@ -502,12 +634,20 @@ class Game:
                     self.explosions.remove(explosion)
             return
 
+        now = pygame.time.get_ticks()
+        if now - self.last_swarm_spawn > self.swarm_interval and len(self.swarmers) < 24:
+            self.last_swarm_spawn = now
+            self.swarm_interval = random.randint(9000, 15000)
+            self.spawn_swarm()
+
         for human in self.humans:
             human.update()
         for lander in list(self.landers):
             lander.update(self.humans)
         for mutant in self.mutants:
             mutant.update(self.ship, self.bullets)
+        for swarmer in self.swarmers:
+            swarmer.update(self.ship)
         for bullet in list(self.bullets):
             bullet.update()
             if bullet.dead():
@@ -523,12 +663,12 @@ class Game:
                 self.explosions.remove(explosion)
 
     def resolve_collisions(self):
-        # player bullets vs landers/mutants
+        # player bullets vs landers/mutants/swarmers
         for bullet in list(self.bullets):
             if bullet.hostile or bullet not in self.bullets:
                 continue
             hit = False
-            for group, is_lander_group in ((self.landers, True), (self.mutants, False)):
+            for group, is_lander_group in ((self.landers, True), (self.mutants, False), (self.swarmers, False)):
                 for enemy in list(group):
                     if abs(wrapped_dx(bullet.x, enemy.x)) < enemy.radius and abs(bullet.y - enemy.y) < enemy.radius:
                         if is_lander_group:
@@ -538,7 +678,7 @@ class Game:
                         self.bullets.remove(bullet)
                         self.explosions.append(Explosion(enemy.x, enemy.y))
                         explosion_sound.play()
-                        self.score += 150
+                        self.score += enemy.score_value
                         self.check_no_humans_left()
                         hit = True
                         break
@@ -567,8 +707,8 @@ class Game:
                 self.ship_hit()
                 return
 
-        # landers/mutants ramming the player
-        for group, is_lander_group in ((self.landers, True), (self.mutants, False)):
+        # landers/mutants/swarmers ramming the player
+        for group, is_lander_group in ((self.landers, True), (self.mutants, False), (self.swarmers, False)):
             for enemy in list(group):
                 dx = wrapped_dx(enemy.x, self.ship.x)
                 dy = enemy.y - self.ship.y
@@ -587,6 +727,7 @@ class Game:
             self.ship_hit()
 
     def ship_hit(self):
+        thrust_channel.stop()
         self.explosions.append(Explosion(self.ship.x, self.ship.y))
         explosion_sound.play()
         self.lives -= 1
@@ -612,6 +753,8 @@ class Game:
             lander.draw(display, cam_x)
         for mutant in self.mutants:
             mutant.draw(display, cam_x)
+        for swarmer in self.swarmers:
+            swarmer.draw(display, cam_x)
         for bullet in self.bullets:
             bullet.draw(display, cam_x)
         for explosion in self.explosions:
@@ -621,6 +764,7 @@ class Game:
             self.ship.draw(display, cam_x)
 
         self.draw_hud(cam_x)
+        self.draw_mutant_radar()
 
         if self.banner_text and pygame.time.get_ticks() < self.banner_until:
             font = pygame.font.SysFont(FONT_NAME, 50)
@@ -679,7 +823,45 @@ class Game:
             pygame.draw.circle(display, MAGENTA, (int(map_x(lander.x)), 26), 2)
         for mutant in self.mutants:
             pygame.draw.circle(display, RED, (int(map_x(mutant.x)), 26), 2)
+        for swarmer in self.swarmers:
+            pygame.draw.circle(display, YELLOW, (int(map_x(swarmer.x)), 26), 1)
         pygame.draw.circle(display, WHITE, (int(map_x(self.ship.x)), 26), 3)
+
+    def draw_mutant_radar(self):
+        panel_w, panel_h = 170, 90
+        panel_x = SCREEN_WIDTH - panel_w - 14
+        panel_y = 135
+        panel = pygame.Rect(panel_x, panel_y, panel_w, panel_h)
+
+        pygame.draw.rect(display, (15, 15, 25), panel)
+        pygame.draw.rect(display, RED, panel, 1)
+
+        font = pygame.font.SysFont(FONT_NAME, 16)
+        display.blit(font.render('THREATS', True, RED), (panel_x + 4, panel_y - 18))
+
+        def to_panel(world_x, world_y):
+            px = panel_x + (world_x % WORLD_WIDTH) / WORLD_WIDTH * panel_w
+            py = panel_y + 8 + (world_y - TOP_MARGIN) / (GROUND_BASE - TOP_MARGIN) * (panel_h - 16)
+            py = max(panel_y + 4, min(panel_y + panel_h - 4, py))
+            return px, py
+
+        # Landers (not yet mutated), true Mutants, and Swarmers all read as
+        # "the aliens chasing me" to a player, so the radar tracks all three
+        threats = [(l, MAGENTA) for l in self.landers] + \
+                  [(m, RED) for m in self.mutants] + \
+                  [(s, YELLOW) for s in self.swarmers]
+
+        if threats:
+            pulse = 3 + (pygame.time.get_ticks() // 200) % 2
+            for enemy, color in threats:
+                ex, ey = to_panel(enemy.x, enemy.y)
+                pygame.draw.circle(display, color, (int(ex), int(ey)), pulse)
+        else:
+            empty_surf = font.render('none nearby', True, (140, 140, 140))
+            display.blit(empty_surf, empty_surf.get_rect(center=panel.center))
+
+        sx, sy = to_panel(self.ship.x, self.ship.y)
+        pygame.draw.circle(display, WHITE, (int(sx), int(sy)), 3)
 
     def run(self):
         self.quit = False
